@@ -1,187 +1,307 @@
-"""
-Generate Grad-CAM visualizations for model interpretation.
 
-Creates visualizations showing where the neural network focuses its attention
-when making predictions, useful for understanding model failures.
+"""
+Dog Emotion Recognition with ResNet18 and Grad-CAM.
+Trains once, saves the model, evaluates on a separate test set,
+and generates Grad-CAM visualizations for misclassified images.
 """
 
 import random
 from pathlib import Path
 
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import transforms, models
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from pytorch_grad_cam.utils.image import show_cam_on_image
 
-from src.config import (
-    DATASET_PATH, OUTPUT_DIR, DEVICE, BATCH_SIZE, 
-    RANDOM_STATE, NUM_CLASSES, IMAGE_SIZE,
-    IMAGENET_MEAN, IMAGENET_STD
-)
+import src.config
 from src.utils import DogEmotionDataset
-from src.models import GradCAM
-from src.visualization import visualize_gradcam
 
-random.seed(RANDOM_STATE)
-torch.manual_seed(RANDOM_STATE)
+# Configuration
+random.seed(src.config.RANDOM_STATE)
+torch.manual_seed(src.config.RANDOM_STATE)
 
-OUTPUT_DIR.mkdir(exist_ok=True)
+DEVICE = src.config.DEVICE
+CLASSES = src.config.EMOTION_CLASSES
+
+# Change these paths if your folder names differ.
+TRAIN_DIR = Path(src.config.DATASET_PATH)
+TEST_DIR = Path("Dataset_segmented_test")
+
+MODEL_DIR = Path("models")
+MODEL_PATH = MODEL_DIR / "gradcam_resnet18.pth"
+OUTPUT_DIR = Path("output/gradcam_failures")
+
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def train_simple_model(train_loader, num_epochs: int = 8):
-    """
-    Train a simple ResNet18 model for Grad-CAM visualization.
-    
-    Args:
-        train_loader: DataLoader for training data
-        num_epochs: Number of training epochs
-        
-    Returns:
-        Trained model
-    """
+def create_model():
+    """Create the ResNet18 emotion classifier."""
     model = models.resnet18(weights=None)
-    model.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)
-    model = model.to(DEVICE)
-    
+    model.fc = nn.Linear(model.fc.in_features, len(CLASSES))
+    return model.to(DEVICE)
+
+
+def train_model(train_loader, epochs=8):
+    """Train ResNet18 on the training dataset."""
+    model = create_model()
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    
-    model.train()
-    for epoch in range(num_epochs):
+
+    for epoch in range(epochs):
+        model.train()
         running_loss = 0.0
         correct = 0
         total = 0
-        
+
         for images, labels, _ in train_loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            
+            images = images.to(DEVICE)
+            labels = labels.to(DEVICE)
+
             optimizer.zero_grad()
             outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-            
-            running_loss += loss.item()
-            _, predicted = outputs.max(1)
+
+            running_loss += loss.item() * labels.size(0)
+            predictions = outputs.argmax(dim=1)
+            correct += (predictions == labels).sum().item()
             total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-        
-        acc = 100. * correct / total
-        print(f"Epoch [{epoch+1}/{num_epochs}] Loss: {running_loss/len(train_loader):.4f} Acc: {acc:.2f}%")
-    
+
+        epoch_loss = running_loss / max(total, 1)
+        accuracy = 100.0 * correct / max(total, 1)
+
+        print(
+            f"Epoch [{epoch + 1}/ {epochs}] "
+            f"Loss: {epoch_loss:.4f} "
+            f"Acc: {accuracy:.2f}%"
+        )
+
+    torch.save(model.state_dict(), MODEL_PATH)
+    print(f"Model saved to: {MODEL_PATH.resolve()}")
     return model
 
 
-def find_and_visualize_failures(model, test_loader, gradcam, num_visualizations: int = 10):
-    """
-    Find misclassified examples and generate Grad-CAM visualizations.
-    
-    Args:
-        model: Trained model
-        test_loader: DataLoader for test data
-        gradcam: GradCAM instance
-        num_visualizations: Number of failures to visualize
-    """
+def load_or_train_model(train_loader):
+    """Load the saved model or train it if it does not exist."""
+    model = create_model()
+
+    if MODEL_PATH.is_file():
+        print(f"Loading saved model: {MODEL_PATH}")
+        state = torch.load(
+            MODEL_PATH, map_location=DEVICE, weights_only=True
+        )
+        model.load_state_dict(state)
+        return model
+
+    print("No saved Grad-CAM model found. Training ResNet18...")
+    return train_model(train_loader)
+
+
+def find_failures(model, test_loader):
+    """Find misclassified test images and their predictions."""
     import torch.nn.functional as F
-    from src.config import EMOTION_CLASSES
-    
+
     model.eval()
     failures = []
-    
+    correct = 0
+    total = 0
+
+    # Grad-CAM is not calculated here, so inference can use no_grad.
     with torch.no_grad():
         for images, labels, paths in test_loader:
-            images_gpu = images.to(DEVICE)
-            outputs = model(images_gpu)
-            probs = F.softmax(outputs, dim=1)
-            _, predicted = outputs.max(1)
-            
-            if predicted.item() != labels.item():
-                confidence = probs[0, predicted.item()].item()
-                failures.append({
-                    'image': images[0],
-                    'true_label': labels.item(),
-                    'pred_label': predicted.item(),
-                    'confidence': confidence,
-                    'path': paths[0]
-                })
-    
-    print(f"Found {len(failures)} misclassified samples")
-    
-    num_to_visualize = min(num_visualizations, len(failures))
-    print(f"Generating Grad-CAM for {num_to_visualize} failure cases...")
-    
-    failures.sort(key=lambda x: x['confidence'], reverse=True)
-    
-    for i, failure in enumerate(failures[:num_to_visualize]):
-        image_tensor = failure['image'].unsqueeze(0).to(DEVICE)
-        image_tensor.requires_grad = True
-        
-        cam, _ = gradcam.generate(image_tensor, failure['pred_label'])
-        
-        save_path = OUTPUT_DIR / f"failure_{i+1}_{EMOTION_CLASSES[failure['true_label']]}_as_{EMOTION_CLASSES[failure['pred_label']]}.png"
-        
-        visualize_gradcam(
-            failure['image'],
-            cam,
-            failure['true_label'],
-            failure['pred_label'],
-            failure['confidence'],
-            save_path
-        )
-        
-        print(f"  Saved: {save_path.name}")
+            images = images.to(DEVICE)
+            labels = labels.to(DEVICE)
+
+            outputs = model(images)
+            probabilities = F.softmax(outputs, dim=1)
+            predictions = outputs.argmax(dim=1)
+
+            for i in range(labels.size(0)):
+                total += 1
+                pred = predictions[i].item()
+                true = labels[i].item()
+
+                if pred == true:
+                    correct += 1
+                else:
+                    failures.append({
+                        "image": images[i].cpu(),
+                        "true_label": true,
+                        "pred_label": pred,
+                        "confidence": probabilities[i, pred].item(),
+                        "path": str(paths[i])
+                    })
+
+    accuracy = 100.0 * correct / max(total, 1)
+    print(f"Test samples: {total}")
+    print(f"Test accuracy: {accuracy:.2f}%")
+    print(f"Misclassified samples: {len(failures)}")
+
+    return failures
+
+
+def denormalize(tensor):
+    """Convert a normalized image tensor to an RGB image."""
+    mean = torch.tensor(
+        src.config.IMAGENET_MEAN
+    ).view(3, 1, 1)
+
+    std = torch.tensor(
+        src.config.IMAGENET_STD
+    ).view(3, 1, 1)
+
+    image = tensor.cpu() * std + mean
+    image = image.clamp(0, 1)
+    return image.permute(1, 2, 0).numpy()
+
+
+def generate_visualizations(model, failures, limit=10):
+    """Generate and save Grad-CAM for selected failures."""
+    if not failures:
+        print("No misclassified images found.")
+        return
+
+    # Visualize the most confident incorrect predictions first.
+    failures.sort(key=lambda item: item["confidence"], reverse=True)
+    selected = failures[:limit]
+
+    target_layer = model.layer4[-1]
+
+    model.eval()
+    print(f"Generating Grad-CAM for {len(selected)} failures...")
+
+    # GradCAM registers hooks on the model. Close it when finished.
+    with GradCAM(
+        model=model,
+        target_layers=[target_layer]
+    ) as cam:
+
+        for i, failure in enumerate(selected, start=1):
+            image_tensor = failure["image"].unsqueeze(0).to(DEVICE)
+
+            # Grad-CAM requires gradients. Do not use torch.no_grad here.
+            target = [
+                ClassifierOutputTarget(failure["pred_label"])
+            ]
+            grayscale_cam = cam(
+                input_tensor=image_tensor,
+                targets=target
+            )[0]
+
+            rgb_image = denormalize(failure["image"])
+            visualization = show_cam_on_image(
+                rgb_image,
+                grayscale_cam,
+                use_rgb=True
+            )
+
+            true_name = CLASSES[failure["true_label"]]
+            pred_name = CLASSES[failure["pred_label"]]
+            confidence = failure["confidence"] * 100
+
+            filename = (
+                f"failure_{i}_{true_name}_as_{pred_name}.jpg"
+            )
+            save_path = OUTPUT_DIR / filename
+
+            cv2.imwrite(
+                str(save_path),
+                cv2.cvtColor(visualization, cv2.COLOR_RGB2BGR)
+            )
+
+            print(
+                f"Saved: {filename} | "
+                f"Actual: {true_name} | "
+                f"Predicted: {pred_name} | "
+                f"Confidence: {confidence:.2f}%"
+            )
 
 
 def main():
-    """Main Grad-CAM generation pipeline."""
     print("=" * 60)
-    print("Grad-CAM Visualization for Model Failures")
+    print("DOG EMOTION RECOGNITION - GRAD-CAM")
     print("=" * 60)
-    print(f"Device: {DEVICE}")
-    
+    print("Device:", DEVICE)
+
+    if not TRAIN_DIR.is_dir():
+        raise FileNotFoundError(
+            f"Training directory not found: {TRAIN_DIR}"
+        )
+
+    if not TEST_DIR.is_dir():
+        raise FileNotFoundError(
+            f"Test directory not found: {TEST_DIR}"
+        )
+
     train_transform = transforms.Compose([
         transforms.Resize((256, 256)),
-        transforms.RandomCrop(IMAGE_SIZE),
+        transforms.RandomCrop(src.config.IMAGE_SIZE),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
+        transforms.Normalize(
+            src.config.IMAGENET_MEAN,
+            src.config.IMAGENET_STD
+        )
     ])
-    
+
     test_transform = transforms.Compose([
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.Resize((
+            src.config.IMAGE_SIZE,
+            src.config.IMAGE_SIZE
+        )),
         transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
+        transforms.Normalize(
+            src.config.IMAGENET_MEAN,
+            src.config.IMAGENET_STD
+        )
     ])
-    
-    print("\n[1/4] Loading dataset...")
-    full_dataset = DogEmotionDataset(DATASET_PATH, transform=train_transform)
-    
-    train_size = int(0.8 * len(full_dataset))
-    test_size = len(full_dataset) - train_size
-    train_dataset, test_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, test_size],
-        generator=torch.Generator().manual_seed(RANDOM_STATE)
+
+    print("\n[1/4] Loading datasets...")
+    train_dataset = DogEmotionDataset(
+        TRAIN_DIR, transform=train_transform
     )
-    
-    test_dataset.dataset.transform = test_transform
-    
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
-    
-    print(f"Training samples: {len(train_dataset)}")
-    print(f"Test samples: {len(test_dataset)}")
-    
-    print("\n[2/4] Training model...")
-    model = train_simple_model(train_loader)
-    
-    print("\n[3/4] Setting up Grad-CAM...")
-    target_layer = model.layer4[-1].conv2
-    gradcam = GradCAM(model, target_layer)
-    
-    print("\n[4/4] Finding failures and generating visualizations...")
-    find_and_visualize_failures(model, test_loader, gradcam)
-    
-    print(f"\nDone! Check {OUTPUT_DIR} for Grad-CAM visualizations")
+    test_dataset = DogEmotionDataset(
+        TEST_DIR, transform=test_transform
+    )
+
+    if len(train_dataset) == 0 or len(test_dataset) == 0:
+        raise ValueError("Training or test dataset is empty.")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=src.config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=0
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0
+    )
+
+    print("Training samples:", len(train_dataset))
+    print("Test samples:", len(test_dataset))
+
+    print("\n[2/4] Loading or training model...")
+    model = load_or_train_model(train_loader)
+
+    print("\n[3/4] Evaluating on the test set...")
+    failures = find_failures(model, test_loader)
+
+    print("\n[4/4] Generating Grad-CAM visualizations...")
+    generate_visualizations(model, failures, limit=10)
+
+    print("\nCompleted!")
+    print("Grad-CAM images:", OUTPUT_DIR.resolve())
 
 
 if __name__ == "__main__":

@@ -69,3 +69,18 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.bak
+
+# Local virtual environment
+.venv/
+
+# Additional datasets and generated dataset splits
+datasets/
+Dataset_test/
+Dataset_test_clean/
+Dataset_trainval/
+Dataset_segmented_trainval_split/
+
+# Generated analysis/output folders
+dog_pose_outputs/
+gradcam_outputs/
+runs/

@@ -6,7 +6,7 @@ from pathlib import Path
 
 # Project paths
 PROJECT_ROOT = Path(__file__).parent.parent
-DATASET_PATH = PROJECT_ROOT / "Dataset"
+DATASET_PATH = PROJECT_ROOT / "Dataset_segmented_trainval"
 CACHE_DIR = PROJECT_ROOT / "cache"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 MODELS_DIR = PROJECT_ROOT / "models"
