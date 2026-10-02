@@ -23,4 +23,16 @@ tqdm>=4.65.0
 
 
 
+streamlit
+torch
+torchvision
+numpy
+pandas
+Pillow
+opencv-python-headless==4.11.0.86
+matplotlib
+seaborn
+scikit-learn
+ultralytics
+tqdm
 

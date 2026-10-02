@@ -10,10 +10,7 @@ import torch.nn as nn
 from torchvision import models, transforms
 
 from ultralytics import YOLO
-from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
-DATASET_DIR = BASE_DIR / "Dataset_test_clean"
 
 # ============================================================
 # CONFIGURATION
@@ -289,21 +286,30 @@ xai_df = load_xai_csv()
 # DATASET IMAGE LOADER
 # ============================================================
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+def get_dataset_images():
 
-if not DATASET_DIR.exists():
-    st.error(f"Dataset folder not found: {DATASET_DIR}")
-    st.stop()
+    if not DATASET_DIR.exists():
+        return []
 
-image_files = sorted(
-    p for p in DATASET_DIR.rglob("*")
-    if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
-)
+    extensions = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".bmp",
+        ".webp",
+    }
 
-if not image_files:
-    st.warning(f"No images found in: {DATASET_DIR}")
-else:
-    st.success(f"Found {len(image_files)} images")
+    images = []
+
+    for path in DATASET_DIR.rglob("*"):
+
+        if (
+            path.is_file()
+            and path.suffix.lower() in extensions
+        ):
+            images.append(path)
+
+    return sorted(images)
 
 
 # ============================================================
